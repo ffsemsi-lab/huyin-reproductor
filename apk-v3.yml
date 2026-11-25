@@ -1,0 +1,420 @@
+name: Fabricar APK v3
+
+on:
+  workflow_dispatch:
+  push:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Descomprimir proyecto si viene en ZIP
+        run: |
+          if [ -f "package.json" ]; then
+            echo "APP_DIR=." >> "$GITHUB_ENV"
+          else
+            ZIP_FILE="$(for f in *.zip; do [ -f "$f" ] && printf '%s\t%s\n' "$(git log -1 --format=%ct -- "$f")" "$f"; done | sort -nr | head -n 1 | cut -f2-)"
+            if [ -z "$ZIP_FILE" ]; then
+              echo "No se encontro archivo .zip"
+              exit 1
+            fi
+            echo "Usando ZIP mas reciente: $ZIP_FILE"
+            rm -rf _app_src
+            mkdir -p _app_src
+            unzip -oq "$ZIP_FILE" -d _app_src
+            PKG_PATH="$(find _app_src -maxdepth 3 -name 'package.json' | head -n 1)"
+            if [ -z "$PKG_PATH" ]; then
+              echo "No se encontro package.json"
+              exit 1
+            fi
+            echo "APP_DIR=$(dirname "$PKG_PATH")" >> "$GITHUB_ENV"
+          fi
+
+      - name: Instalar y compilar app web
+        working-directory: ${{ env.APP_DIR }}
+        run: |
+          npm install --legacy-peer-deps
+          npm run build
+
+      - name: Empaquetar en Android con Capacitor
+        working-directory: ${{ env.APP_DIR }}
+        run: |
+          npm install --no-save --legacy-peer-deps @capacitor/core @capacitor/cli @capacitor/android
+          cat <<'CFG' > capacitor.config.json
+          {
+            "appId": "com.huyin.reproductor",
+            "appName": "Huyin",
+            "webDir": "dist",
+            "android": {
+              "adjustMarginsForEdgeToEdge": "force",
+              "backgroundColor": "#0B0D12"
+            },
+            "plugins": {
+              "SystemBars": {
+                "insetsHandling": "disable"
+              }
+            }
+          }
+          CFG
+          if [ ! -d android ]; then
+            npx cap add android
+          fi
+          npx cap sync android
+
+      - name: Configurar pantalla normal, permisos y selector nativo de carpetas
+        working-directory: ${{ env.APP_DIR }}
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          manifest_path = Path("android/app/src/main/AndroidManifest.xml")
+          manifest = manifest_path.read_text(encoding="utf-8")
+          perms = [
+              '    <uses-permission android:name="android.permission.READ_MEDIA_AUDIO" />',
+              '    <uses-permission android:name="android.permission.READ_MEDIA_VIDEO" />',
+              '    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />',
+          ]
+          missing = [p for p in perms if p.split('"')[1] not in manifest]
+          if missing:
+              manifest = manifest.replace("<application", "\n".join(missing) + "\n\n    <application", 1)
+          if 'android:requestLegacyExternalStorage="true"' not in manifest:
+              manifest = manifest.replace("<application", '<application android:requestLegacyExternalStorage="true"', 1)
+          manifest_path.write_text(manifest, encoding="utf-8")
+
+          java_dir = Path("android/app/src/main/java/com/huyin/reproductor")
+          java_dir.mkdir(parents=True, exist_ok=True)
+
+          (java_dir / "LocalMediaPlugin.java").write_text('''package com.huyin.reproductor;
+
+          import android.Manifest;
+          import android.content.ContentResolver;
+          import android.database.Cursor;
+          import android.net.Uri;
+          import android.os.Build;
+          import android.os.Environment;
+          import android.provider.MediaStore;
+          import com.getcapacitor.JSArray;
+          import com.getcapacitor.JSObject;
+          import com.getcapacitor.PermissionState;
+          import com.getcapacitor.Plugin;
+          import com.getcapacitor.PluginCall;
+          import com.getcapacitor.PluginMethod;
+          import com.getcapacitor.annotation.CapacitorPlugin;
+          import com.getcapacitor.annotation.Permission;
+          import com.getcapacitor.annotation.PermissionCallback;
+          import java.io.File;
+          import java.util.ArrayList;
+          import java.util.Arrays;
+          import java.util.Collections;
+          import java.util.Comparator;
+          import java.util.HashMap;
+          import java.util.HashSet;
+          import java.util.LinkedHashMap;
+          import java.util.List;
+          import java.util.Locale;
+          import java.util.Map;
+          import java.util.Set;
+
+          @CapacitorPlugin(
+              name = "LocalMedia",
+              permissions = {
+                  @Permission(
+                      strings = { Manifest.permission.READ_MEDIA_AUDIO, Manifest.permission.READ_MEDIA_VIDEO },
+                      alias = "media"
+                  ),
+                  @Permission(
+                      strings = { Manifest.permission.READ_EXTERNAL_STORAGE },
+                      alias = "storage"
+                  )
+              }
+          )
+          public class LocalMediaPlugin extends Plugin {
+              private static final Set<String> AUDIO_EXTS = new HashSet<>(Arrays.asList(
+                  "mp3", "wav", "ogg", "oga", "flac", "aac", "m4a", "opus", "weba", "wma"
+              ));
+              private static final Set<String> VIDEO_EXTS = new HashSet<>(Arrays.asList(
+                  "mp4", "m4v", "webm", "mkv", "mov", "avi", "ogv", "3gp"
+              ));
+
+              private String activeAlias() {
+                  return Build.VERSION.SDK_INT >= 33 ? "media" : "storage";
+              }
+
+              private String detectKind(String name) {
+                  int dot = name.lastIndexOf('.');
+                  if (dot < 0 || dot >= name.length() - 1) return null;
+                  String ext = name.substring(dot + 1).toLowerCase(Locale.ROOT);
+                  if (AUDIO_EXTS.contains(ext)) return "audio";
+                  if (VIDEO_EXTS.contains(ext)) return "video";
+                  return null;
+              }
+
+              @PluginMethod
+              public void ensurePermissions(PluginCall call) {
+                  String alias = activeAlias();
+                  if (getPermissionState(alias) == PermissionState.GRANTED) {
+                      JSObject ret = new JSObject();
+                      ret.put("granted", true);
+                      call.resolve(ret);
+                      return;
+                  }
+                  requestPermissionForAlias(alias, call, "mediaPermCallback");
+              }
+
+              @PermissionCallback
+              private void mediaPermCallback(PluginCall call) {
+                  JSObject ret = new JSObject();
+                  ret.put("granted", getPermissionState(activeAlias()) == PermissionState.GRANTED);
+                  call.resolve(ret);
+              }
+
+              private void queryMediaStoreCounts(Map<String, Integer> folderCounts) {
+                  ContentResolver cr = getContext().getContentResolver();
+                  Uri[] uris = new Uri[] {
+                      MediaStore.Audio.Media.EXTERNAL_CONTENT_URI,
+                      MediaStore.Video.Media.EXTERNAL_CONTENT_URI
+                  };
+                  String[] proj = new String[] { MediaStore.MediaColumns.DATA };
+                  for (Uri uri : uris) {
+                      try (Cursor c = cr.query(uri, proj, null, null, null)) {
+                          if (c == null) continue;
+                          int idx = c.getColumnIndex(MediaStore.MediaColumns.DATA);
+                          if (idx < 0) continue;
+                          while (c.moveToNext()) {
+                              String filePath = c.getString(idx);
+                              if (filePath == null) continue;
+                              File f = new File(filePath);
+                              String parent = f.getParent();
+                              if (parent != null) {
+                                  folderCounts.put(parent, folderCounts.getOrDefault(parent, 0) + 1);
+                              }
+                          }
+                      } catch (Exception ignored) {
+                      }
+                  }
+              }
+
+              @PluginMethod
+              public void listDirectory(PluginCall call) {
+                  File root = Environment.getExternalStorageDirectory();
+                  String rootPath = root.getAbsolutePath();
+                  String reqPath = call.getString("path");
+                  File current = (reqPath != null && !reqPath.trim().isEmpty()) ? new File(reqPath) : root;
+                  if (!current.exists() || !current.isDirectory()) {
+                      current = root;
+                  }
+                  String currentPath = current.getAbsolutePath();
+
+                  Map<String, Integer> mediaStoreCounts = new HashMap<>();
+                  queryMediaStoreCounts(mediaStoreCounts);
+
+                  int mediaCountHere = 0;
+                  Map<String, JSObject> dirMap = new LinkedHashMap<>();
+
+                  File[] children = current.listFiles();
+                  if (children != null) {
+                      Arrays.sort(children, Comparator.comparing(File::getName, String.CASE_INSENSITIVE_ORDER));
+                      for (File child : children) {
+                          String name = child.getName();
+                          if (name.startsWith(".")) continue;
+                          if (child.isDirectory()) {
+                              if ("Android".equals(name) && currentPath.equals(rootPath)) continue;
+                              int count = mediaStoreCounts.getOrDefault(child.getAbsolutePath(), 0);
+                              if (count == 0) {
+                                  File[] sub = child.listFiles();
+                                  if (sub != null) {
+                                      for (File s : sub) {
+                                          if (s.isFile() && detectKind(s.getName()) != null) count++;
+                                      }
+                                  }
+                              }
+                              JSObject d = new JSObject();
+                              d.put("name", name);
+                              d.put("path", child.getAbsolutePath());
+                              d.put("mediaCount", count);
+                              dirMap.put(child.getAbsolutePath(), d);
+                          } else if (child.isFile() && detectKind(name) != null) {
+                              mediaCountHere++;
+                          }
+                      }
+                  }
+
+                  for (Map.Entry<String, Integer> entry : mediaStoreCounts.entrySet()) {
+                      String folderPath = entry.getKey();
+                      if (folderPath.equals(currentPath)) {
+                          if (mediaCountHere == 0) mediaCountHere = entry.getValue();
+                          continue;
+                      }
+                      if (folderPath.startsWith(currentPath + "/")) {
+                          String rest = folderPath.substring(currentPath.length() + 1);
+                          int slash = rest.indexOf('/');
+                          String directChildName = slash >= 0 ? rest.substring(0, slash) : rest;
+                          if (!directChildName.isEmpty() && !directChildName.startsWith(".")) {
+                              String directChildPath = currentPath + "/" + directChildName;
+                              if (!dirMap.containsKey(directChildPath)) {
+                                  JSObject d = new JSObject();
+                                  d.put("name", directChildName);
+                                  d.put("path", directChildPath);
+                                  d.put("mediaCount", slash < 0 ? entry.getValue() : 0);
+                                  dirMap.put(directChildPath, d);
+                              }
+                          }
+                      }
+                  }
+
+                  JSArray directories = new JSArray();
+                  List<JSObject> sortedDirs = new ArrayList<>(dirMap.values());
+                  Collections.sort(sortedDirs, (a, b) -> a.optString("name", "").compareToIgnoreCase(b.optString("name", "")));
+                  for (JSObject d : sortedDirs) {
+                      directories.put(d);
+                  }
+
+                  JSArray shortcuts = new JSArray();
+                  String[][] quickCandidates = new String[][] {
+                      { "Almacenamiento interno", rootPath },
+                      { "Música", Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MUSIC).getAbsolutePath() },
+                      { "Descargas", Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS).getAbsolutePath() },
+                      { "Películas", Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MOVIES).getAbsolutePath() },
+                      { "Podcasts", Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PODCASTS).getAbsolutePath() }
+                  };
+                  for (String[] item : quickCandidates) {
+                      File f = new File(item[1]);
+                      if (f.exists() && f.isDirectory()) {
+                          JSObject s = new JSObject();
+                          s.put("name", item[0]);
+                          s.put("path", f.getAbsolutePath());
+                          shortcuts.put(s);
+                      }
+                  }
+
+                  String parentPath = null;
+                  if (!currentPath.equals(rootPath)) {
+                      File p = current.getParentFile();
+                      if (p != null && p.getAbsolutePath().startsWith(rootPath)) {
+                          parentPath = p.getAbsolutePath();
+                      }
+                  }
+
+                  JSObject res = new JSObject();
+                  res.put("currentPath", currentPath);
+                  res.put("parentPath", parentPath);
+                  res.put("rootPath", rootPath);
+                  res.put("directories", directories);
+                  res.put("mediaCountHere", mediaCountHere);
+                  res.put("shortcuts", shortcuts);
+                  call.resolve(res);
+              }
+
+              @PluginMethod
+              public void scanDirectory(PluginCall call) {
+                  String dirPath = call.getString("path");
+                  int maxFiles = call.getInt("maxFiles", 600);
+                  if (dirPath == null || dirPath.trim().isEmpty()) {
+                      JSObject empty = new JSObject();
+                      empty.put("files", new JSArray());
+                      call.resolve(empty);
+                      return;
+                  }
+
+                  File rootDir = new File(dirPath);
+                  List<JSObject> found = new ArrayList<>();
+                  Set<String> seenPaths = new HashSet<>();
+
+                  List<File> queue = new ArrayList<>();
+                  queue.add(rootDir);
+                  for (int i = 0; i < queue.size() && found.size() < maxFiles; i++) {
+                      File dir = queue.get(i);
+                      File[] items = dir.listFiles();
+                      if (items == null) continue;
+                      Arrays.sort(items, Comparator.comparing(File::getName, String.CASE_INSENSITIVE_ORDER));
+                      for (File item : items) {
+                          if (found.size() >= maxFiles) break;
+                          String name = item.getName();
+                          if (name.startsWith(".")) continue;
+                          if (item.isDirectory()) {
+                              if (!"Android".equals(name)) {
+                                  queue.add(item);
+                              }
+                          } else if (item.isFile()) {
+                              String kind = detectKind(name);
+                              if (kind != null && seenPaths.add(item.getAbsolutePath())) {
+                                  JSObject obj = new JSObject();
+                                  obj.put("name", name);
+                                  obj.put("path", item.getAbsolutePath());
+                                  obj.put("size", item.length());
+                                  obj.put("lastModified", item.lastModified());
+                                  obj.put("kind", kind);
+                                  found.add(obj);
+                              }
+                          }
+                      }
+                  }
+
+                  if (found.size() < maxFiles) {
+                      ContentResolver cr = getContext().getContentResolver();
+                      String prefix = rootDir.getAbsolutePath() + "/";
+                      Uri[] uris = new Uri[] {
+                          MediaStore.Audio.Media.EXTERNAL_CONTENT_URI,
+                          MediaStore.Video.Media.EXTERNAL_CONTENT_URI
+                      };
+                      String[] proj = new String[] {
+                          MediaStore.MediaColumns.DATA,
+                          MediaStore.MediaColumns.DISPLAY_NAME,
+                          MediaStore.MediaColumns.SIZE,
+                          MediaStore.MediaColumns.DATE_MODIFIED
+                      };
+                      for (int u = 0; u < uris.length && found.size() < maxFiles; u++) {
+                          String kindFallback = u == 0 ? "audio" : "video";
+                          try (Cursor c = cr.query(uris[u], proj, MediaStore.MediaColumns.DATA + " LIKE ?", new String[] { prefix + "%" }, null)) {
+                              if (c == null) continue;
+                              int dataIdx = c.getColumnIndex(MediaStore.MediaColumns.DATA);
+                              int nameIdx = c.getColumnIndex(MediaStore.MediaColumns.DISPLAY_NAME);
+                              int sizeIdx = c.getColumnIndex(MediaStore.MediaColumns.SIZE);
+                              int modIdx = c.getColumnIndex(MediaStore.MediaColumns.DATE_MODIFIED);
+                              while (c.moveToNext() && found.size() < maxFiles) {
+                                  String p = dataIdx >= 0 ? c.getString(dataIdx) : null;
+                                  if (p == null || !seenPaths.add(p)) continue;
+                                  File f = new File(p);
+                                  String n = (nameIdx >= 0 && c.getString(nameIdx) != null) ? c.getString(nameIdx) : f.getName();
+                                  String kind = detectKind(n);
+                                  if (kind == null) kind = kindFallback;
+                                  long sz = sizeIdx >= 0 ? c.getLong(sizeIdx) : f.length();
+                                  long mod = modIdx >= 0 ? c.getLong(modIdx) * 1000L : f.lastModified();
+                                  JSObject obj = new JSObject();
+                                  obj.put("name", n);
+                                  obj.put("path", p);
+                                  obj.put("size", sz);
+                                  obj.put("lastModified", mod);
+                                  obj.put("kind", kind);
+                                  found.add(obj);
+                              }
+                          } catch (Exception ignored) {
+                          }
+                      }
+                  }
+
+                  JSArray arr = new JSArray();
+                  for (JSObject o : found) {
+                      arr.put(o);
+                  }
+                  JSObject res = new JSObject();
+                  res.put("files", arr);
+                  call.resolve(res);
+              }
+          }
+          ''', encoding="utf-8")
+
+          (java_dir / "
